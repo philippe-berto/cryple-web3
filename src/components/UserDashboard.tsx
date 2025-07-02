@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { retrieveSeedPhrase, deriveEncryptionKey, sendEncryptedDataToBackend, fetchAndDecryptDataFromBackend, testEncryptionDecryption } from '@/lib/crypto';
+import { retrieveSeedPhrase, deriveEncryptionKey, sendEncryptedDataToBackend, fetchAndDecryptDataFromBackend, testEncryptionDecryption, deleteKeyValueFromBackend } from '@/lib/crypto';
 
 interface UserDashboardProps {
   userAddress: string;
@@ -33,6 +33,17 @@ export default function UserDashboard({ userAddress, onLogout }: UserDashboardPr
     }
   }, [encryptionKey]);
 
+  // Auto-hide error messages after 5 seconds
+  useEffect(() => {
+    if (error) {
+      const timer = setTimeout(() => {
+        setError('');
+      }, 5000);
+      
+      return () => clearTimeout(timer);
+    }
+  }, [error]);
+
   const initializeEncryptionKey = async () => {
     try {
       // We need to get the user's password to retrieve the seed phrase
@@ -41,14 +52,14 @@ export default function UserDashboard({ userAddress, onLogout }: UserDashboardPr
       const password = sessionStorage.getItem('userPassword');
       
       if (!password) {
-        setError('Please log in again to access encrypted data');
+        onLogout('Session expired. Please log in again to access your encrypted data.');
         return;
       }
 
       const seedPhrase = await retrieveSeedPhrase(password);
       
       if (!seedPhrase) {
-        setError('Failed to retrieve seed phrase');
+        onLogout('Failed to retrieve your account data. Please log in again.');
         return;
       }
 
@@ -65,7 +76,7 @@ export default function UserDashboard({ userAddress, onLogout }: UserDashboardPr
       
       setEncryptionKey(key);
     } catch (err) {
-      setError('Failed to initialize encryption');
+      onLogout('Failed to initialize encryption. Please log in again.');
     }
   };
 
@@ -99,7 +110,7 @@ export default function UserDashboard({ userAddress, onLogout }: UserDashboardPr
     if (!newKey.trim() || !newValue.trim()) return;
     
     if (!encryptionKey) {
-      setError('Encryption key not available. Please refresh the page and try again.');
+      onLogout('Session expired. Please log in again to access your encrypted data.');
       return;
     }
 
@@ -119,12 +130,24 @@ export default function UserDashboard({ userAddress, onLogout }: UserDashboardPr
         throw new Error(result.message || 'Failed to store data');
       }
 
-      // Clear form fields
-      setNewKey('');
-      setNewValue('');
-      
-      // Reload data from backend to get the updated list
-      await loadData();
+      // If we got the new item data from the API response, add it directly to the list
+      if (result.data && result.data.id) {
+        const newItem: KeyValuePair = {
+          id: result.data.id,
+          key: newKey.trim(),
+          value: newValue.trim(),
+          createdAt: result.data.created_at || new Date().toISOString(),
+        };
+        
+        // Add the new item to the beginning of the list
+        setKeyValuePairs(prevPairs => [newItem, ...prevPairs]);
+        
+        // Clear form fields only on success
+        setNewKey('');
+        setNewValue('');
+      }
+
+      // No fallback reload - just let the error handling show the message
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to add data');
     } finally {
@@ -134,12 +157,34 @@ export default function UserDashboard({ userAddress, onLogout }: UserDashboardPr
 
   const handleDeleteKeyValue = async (id: string) => {
     try {
-      // TODO: Implement delete functionality with backend API
-      // For now, we'll keep the current behavior
-      const updatedPairs = keyValuePairs.filter(pair => pair.id !== id);
-      setKeyValuePairs(updatedPairs);
+      setLoading(true);
+      
+      // Call the backend to delete the item
+      const result = await deleteKeyValueFromBackend(userAddress, id);
+      
+      if (result.success) {
+        // Update the UI by removing the deleted item from the list
+        const updatedPairs = keyValuePairs.filter(pair => pair.id !== id);
+        setKeyValuePairs(updatedPairs);
+        setError(''); // Clear any previous errors
+      } else {
+        // Handle different error cases
+        if (result.message === 'Authentication failed') {
+          // Authentication failed - log out the user
+          onLogout('Session expired. Please log in again.');
+        } else {
+          // Other errors - show message but don't reload data
+          setError(result.message || 'Failed to delete data');
+          // Auto-hide error after 5 seconds
+          setTimeout(() => setError(''), 5000);
+        }
+      }
     } catch (err) {
       setError('Failed to delete data');
+      // Auto-hide error after 5 seconds
+      setTimeout(() => setError(''), 5000);
+    } finally {
+      setLoading(false);
     }
   };
 

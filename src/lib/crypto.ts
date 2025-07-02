@@ -47,11 +47,27 @@ export async function importSeedPhrase(
     throw new Error('Invalid seed phrase');
   }
   
-  // Store the imported seed phrase
+  // Derive user address first to check if user exists
+  const userAddress = await deriveUserAddress(mnemonic);
+  const hashedPassword = await getHash(password);
+  
+  // Check if user exists on the server
+  const response = await fetch(`${getBaseApiUrl()}/users/check`, {
+    method: 'GET',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${userAddress}:${hashedPassword}`,
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error('User not found or invalid credentials');
+  }
+  
+  // Store the imported seed phrase locally
   await storeSeedPhrase(mnemonic, password);
   
-  // Derive user address and encryption key
-  const userAddress = await deriveUserAddress(mnemonic);
+  // Derive encryption key
   const encryptionKey = await deriveEncryptionKey(mnemonic);
   
   return { userAddress, encryptionKey };
@@ -70,13 +86,13 @@ export async function deriveUserAddress(seedPhrase: string): Promise<string> {
   // Convert mnemonic to seed using BIP39
   const seed = await bip39.mnemonicToSeed(seedPhrase);
   
-  // Hash the seed using SHA-256
-  const hash = sha256(seed);
-  
-  // Take first 20 bytes and convert to hex string (like an Ethereum address)
-  return Array.from(hash.slice(0, 20))
+  // Convert seed to string for hashing
+  const seedString = Array.from(seed)
     .map(b => b.toString(16).padStart(2, '0'))
     .join('');
+  
+  // Use shared hash function for consistency (64 hex characters)
+  return await getHash(seedString);
 }
 
 /**
@@ -299,16 +315,17 @@ export async function decryptKeyValue(
 }
 
 /**
- * Hashes a password using SHA-256 for backend authentication
+ * Generates a SHA-256 hash and returns it as a 64-character hex string
+ * Used for both user addresses and password hashing
  */
-export async function hashPassword(password: string): Promise<string> {
+export async function getHash(input: string): Promise<string> {
   const encoder = new TextEncoder();
-  const data = encoder.encode(password);
+  const data = encoder.encode(input);
   
   // Use sha256 from @noble/hashes for consistency
   const hash = sha256(data);
   
-  // Convert to hex string
+  // Convert to hex string (64 characters)
   return Array.from(hash)
     .map(b => b.toString(16).padStart(2, '0'))
     .join('');
@@ -322,25 +339,38 @@ export async function authenticateWithBackend(
   password: string
 ): Promise<{ success: boolean; message?: string }> {
   try {
-    const hashedPassword = await hashPassword(password);
+    const hashedPassword = await getHash(password);
     
-    const response = await fetch(`${getBaseApiUrl()}/sign-in`, {
+    const response = await fetch(`${getBaseApiUrl()}/users`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
         user_address: userAddress,
-        hashed_password: hashedPassword,
+        password: hashedPassword,
       }),
     });
 
-    if (response.ok) {
-      const data = await response.json();
-      return { success: true, message: data.message };
+    if (response.status === 201) {
+      let data: any = {};
+      try {
+        const text = await response.text();
+        if (text) {
+          data = JSON.parse(text);
+        }
+      } catch (parseError) {
+        console.log('Warning: Could not parse response JSON, but 201 status indicates success');
+      }
+      return { success: true, message: data.message || 'Authentication successful' };
     } else {
-      const errorData = await response.json();
-      return { success: false, message: errorData.error || 'Authentication failed' };
+      try {
+        const errorData = await response.json();
+        return { success: false, message: errorData.error || 'Authentication failed' };
+      } catch (parseError) {
+        console.log('Auth failed - status:', response.status, 'Could not parse error response');
+        return { success: false, message: `Authentication failed (${response.status})` };
+      }
     }
   } catch (error) {
     return { success: false, message: 'Failed to connect to server' };
@@ -355,12 +385,17 @@ export async function sendEncryptedDataToBackend(
   key: string,
   value: string,
   encryptionKey: CryptoKey
-): Promise<{ success: boolean; message?: string }> {
+): Promise<{ success: boolean; message?: string; data?: { id: string; created_at?: string } }> {
   try {
     // Encrypt the key-value pair
     const encryptedData = await encryptKeyValue(key, value, encryptionKey);
+    const password = sessionStorage.getItem('userPassword');
+    if (!password) {
+      return { success: false, message: 'Password not available for authentication' };
+    }
+    const hashedPassword = await getHash(password);
     
-    const response = await fetch(`${getBaseApiUrl()}/values`, {
+    const response = await fetch(`${getBaseApiUrl()}/keys`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -369,14 +404,22 @@ export async function sendEncryptedDataToBackend(
         user_address: userAddress,
         encrypted_key: encryptedData.encryptedKey,
         encrypted_data: encryptedData.encryptedData,
-        iv: encryptedData.iv,
+        data_iv: encryptedData.iv,
         key_iv: encryptedData.keyIv,
+        password: hashedPassword,
       }),
     });
 
     if (response.ok) {
       const data = await response.json();
-      return { success: true, message: data.message };
+      return { 
+        success: true, 
+        message: data.message,
+        data: {
+          id: data.id,
+          created_at: data.created_at
+        }
+      };
     } else {
       const errorData = await response.json();
       return { success: false, message: errorData.error || 'Failed to store data' };
@@ -394,49 +437,60 @@ export async function fetchAndDecryptDataFromBackend(
   encryptionKey: CryptoKey
 ): Promise<{ success: boolean; data?: Array<{key: string, value: string, id: string, createdAt: string}>; message?: string }> {
   try {
-    const response = await fetch(`${getBaseApiUrl()}/values?user_address=${encodeURIComponent(userAddress)}`, {
+    const password = sessionStorage.getItem('userPassword');
+    if (!password) {
+      return { success: false, message: 'Password not available for authentication' };
+    }
+    
+    const hashedPassword = await getHash(password);
+    
+    const response = await fetch(`${getBaseApiUrl()}/keys`, {
       method: 'GET',
       headers: {
         'Content-Type': 'application/json',
+        'Authorization': `Bearer ${userAddress}:${hashedPassword}`,
       },
     });
 
-    if (!response.ok) {
-      const errorData = await response.json();
-      return { success: false, message: errorData.error || 'Failed to fetch data' };
+    if (response.status === 204) {
+      return { success: true, data: [] };
     }
 
-    const responseData = await response.json();
-    const encryptedDataArray = responseData.data || [];
+    if (!response.ok) {
+      return { success: false, message: 'Failed to fetch data' };
+    }
+
+    const data = await response.json();
     
     // Decrypt each item
     const decryptedData = await Promise.all(
-      encryptedDataArray.map(async (item: any, index: number) => {
+      data.map(async (item: any, index: number) => {
         try {
           const { key, value } = await decryptKeyValue(
             item.encrypted_key,
             item.encrypted_data,
             item.key_iv,
-            item.iv,
+            item.data_iv, // Changed from item.iv to item.data_iv to match server response
             encryptionKey
           );
           
           return {
-            id: `${item.user_address}_${index}_${Date.now()}`, // Generate unique ID
+            id: `${item.id}`,
             key,
             value,
-            createdAt: new Date().toISOString(), // Backend doesn't provide timestamp yet
+            createdAt: `${item.created_at}`,
           };
         } catch (decryptError) {
+          console.log('Decryption error for item:', item.id, decryptError); // Debug log
           return null;
         }
       })
     );
 
     // Filter out failed decryptions
-    const validData = decryptedData.filter(item => item !== null);
+    // const validData = decryptedData.filter(item => item !== null);
     
-    return { success: true, data: validData };
+    return { success: true, data: decryptedData };
   } catch (error) {
     return { success: false, message: 'Failed to connect to server' };
   }
@@ -497,6 +551,78 @@ export function clearSessionData(): void {
 export async function verifyPassword(password: string): Promise<boolean> {
   const seedPhrase = await retrieveSeedPhrase(password);
   return seedPhrase !== null;
+}
+
+/**
+ * Deletes a key-value pair from the backend
+ */
+export async function deleteKeyValueFromBackend(
+  userAddress: string,
+  id: string
+): Promise<{ success: boolean; message?: string }> {
+  try {
+    const password = sessionStorage.getItem('userPassword');
+    if (!password) {
+      return { success: false, message: 'Password not available for authentication' };
+    }
+    
+    const hashedPassword = await getHash(password);
+    
+    const response = await fetch(`${getBaseApiUrl()}/keys/${id}`, {
+      method: 'DELETE',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${userAddress}:${hashedPassword}`,
+      },
+    });
+
+    if (response.status === 204) {
+      return { success: true, message: 'Data deleted successfully' };
+    } else if (response.status === 401) {
+      return { success: false, message: 'Authentication failed' };
+    } else if (response.status === 500) {
+      return { success: false, message: 'Server error occurred' };
+    } else {
+      try {
+        const errorData = await response.json();
+        return { success: false, message: errorData.error || 'Failed to delete data' };
+      } catch (parseError) {
+        return { success: false, message: `Delete failed (${response.status})` };
+      }
+    }
+  } catch (error) {
+    return { success: false, message: 'Failed to connect to server' };
+  }
+}
+
+/**
+ * Verifies user credentials with the backend using /users/check endpoint
+ */
+export async function verifyUserCredentials(
+  userAddress: string,
+  password: string
+): Promise<{ success: boolean; message?: string }> {
+  try {
+    const hashedPassword = await getHash(password);
+    
+    const response = await fetch(`${getBaseApiUrl()}/users/check`, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${userAddress}:${hashedPassword}`,
+      },
+    });
+
+    if (response.status === 200) {
+      return { success: true, message: 'Login successful' };
+    } else if (response.status === 404) {
+      return { success: false, message: 'Invalid credentials. Please check your password and try again.' };
+    } else {
+      return { success: false, message: 'Server error occurred. Please try again later.' };
+    }
+  } catch (error) {
+    return { success: false, message: 'Failed to connect to server. Please check your internet connection.' };
+  }
 }
 
 // Utility functions

@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { generateSeedPhrase, deriveUserAddress, storeSeedPhrase, retrieveSeedPhrase, validateSeedPhrase, importSeedPhrase, authenticateWithBackend, clearSessionData } from '@/lib/crypto';
+import { generateSeedPhrase, deriveUserAddress, storeSeedPhrase, retrieveSeedPhrase, validateSeedPhrase, importSeedPhrase, authenticateWithBackend, clearSessionData, verifyUserCredentials } from '@/lib/crypto';
 
 interface LoginFormProps {
   onLogin: (userAddress: string) => void;
@@ -26,7 +26,7 @@ export default function LoginForm({ onLogin, initialErrorMessage }: LoginFormPro
 
     try {
       if (mode === 'login') {
-        // Login flow - try to decrypt stored seed phrase with password
+        // Login flow - retrieve stored seed phrase and verify with backend
         const seedPhrase = await retrieveSeedPhrase(password);
         if (!seedPhrase) {
           throw new Error('Account not found or incorrect password');
@@ -34,10 +34,10 @@ export default function LoginForm({ onLogin, initialErrorMessage }: LoginFormPro
         
         const userAddress = await deriveUserAddress(seedPhrase);
         
-        // Authenticate with backend server
-        const authResult = await authenticateWithBackend(userAddress, password);
-        if (!authResult.success) {
-          throw new Error(authResult.message || 'Backend authentication failed');
+        // Verify credentials with backend using /users/check
+        const verifyResult = await verifyUserCredentials(userAddress, password);
+        if (!verifyResult.success) {
+          throw new Error(verifyResult.message || 'Login failed');
         }
         
         // Store password temporarily for encryption key derivation
@@ -57,12 +57,6 @@ export default function LoginForm({ onLogin, initialErrorMessage }: LoginFormPro
         }
 
         const { userAddress } = await importSeedPhrase(importSeedPhraseText.trim(), password);
-        
-        // Authenticate imported account with backend server
-        const authResult = await authenticateWithBackend(userAddress, password);
-        if (!authResult.success) {
-          throw new Error(authResult.message || 'Backend authentication failed');
-        }
         
         // Store password temporarily for encryption key derivation
         sessionStorage.setItem('userPassword', password);
